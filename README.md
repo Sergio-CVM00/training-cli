@@ -54,6 +54,26 @@ You can copy it somewhere on your `PATH`, or run it through Cargo while developi
 cargo run -- --help
 ```
 
+## Give this to your agent
+
+Ask your coding agent to run this if you want it to install `training-cli` from GitHub:
+
+```bash
+git clone https://github.com/Sergio-CVM00/training-cli.git
+cd training-cli
+cargo build --release
+mkdir -p "$HOME/.local/bin"
+cp target/release/training "$HOME/.local/bin/training"
+training --help
+training init
+```
+
+If `~/.local/bin` is not on your `PATH`, use the binary directly:
+
+```bash
+./target/release/training --help
+```
+
 ## Quick start
 
 Initialize local storage:
