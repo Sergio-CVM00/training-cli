@@ -1,5 +1,7 @@
 # training-cli
 
+![training-cli product hero](assets/readme-hero.png)
+
 `training-cli` is a tiny local workout memory for your terminal.
 
 It exists for one reason: keep training logs structured enough that you and AI coaching agents can actually use them later. No app account, no cloud sync, no dashboard ceremony. Just a fast native CLI, a local SQLite database, and clean exports.
