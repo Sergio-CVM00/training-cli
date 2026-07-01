@@ -1,6 +1,6 @@
 # training-cli
 
-![training-cli product hero](assets/readme-hero.png)
+![training-cli product hero](assets/readme-hero.svg)
 
 `training-cli` is a tiny local workout memory for your terminal.
 
