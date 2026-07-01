@@ -16,7 +16,4 @@
   <text x="172" y="380" fill="#9b948c" font-family="SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="26" font-weight="500" letter-spacing="0">
     saved workout log -> local sqlite
   </text>
-  <text x="172" y="432" fill="#ee6f61" font-family="SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="26" font-weight="600" letter-spacing="0">
-    structured training memory
-  </text>
 </svg>
