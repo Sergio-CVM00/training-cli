@@ -1,0 +1,4 @@
+interface:
+  display_name: "Training Progression Review"
+  short_description: "Review progression eligibility"
+  default_prompt: "Use $training-progression-review to decide the next target from recent training history."

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Training Session Logger"
+  short_description: "Capture complete workout facts"
+  default_prompt: "Use $training-session-logger to log this workout and list any missing fields."

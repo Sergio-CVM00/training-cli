@@ -1,0 +1,4 @@
+interface:
+  display_name: "Training Logbook"
+  short_description: "Log and retrieve training consistently"
+  default_prompt: "Use $training-logbook to log this workout and flag any missing training facts."
