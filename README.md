@@ -2,9 +2,20 @@
 
 ![training-cli product hero](assets/readme-hero.svg)
 
-`training-cli` is a tiny local workout memory for your terminal.
+`training-cli` is a tiny local workout memory for your terminal and for the agents that help you train.
 
 It exists for one reason: keep training logs structured enough that you and AI coaching agents can actually use them later. No app account, no cloud sync, no dashboard ceremony. Just a fast native CLI, a local SQLite database, and clean exports.
+
+## What is this for?
+
+Use `training-cli` when you want an agent to log training efficiently, retrieve the facts later, and reason from real workout history instead of chat memory.
+
+The tool is built around a simple split:
+
+- Facts: exercises, sets, reps, loads, dates, RPE/RIR, pain, form, recovery, and notes.
+- Interpretations: trends, fatigue signals, progression eligibility, deload needs, and next-session targets.
+
+Agents should use logged data when it exists, avoid inventing missing facts, and keep progression conservative when pain, poor form, low recovery, fatigue, deload context, or missing critical history would make a recommendation unreliable.
 
 ## Why use it?
 
@@ -34,7 +45,32 @@ into structured local data that can be queried, corrected, and exported.
 - Exports deterministic Markdown/JSON context for AI agents.
 - Runs as a small Rust binary with low startup overhead.
 
-## Install from source
+## Use cases
+
+Typical prompts for an agent:
+
+```txt
+hey agent log incline-bench-press 5 series x 10 reps, rpe 7, no elbow pain
+```
+
+```txt
+help me create a plan to progress in incline bench press
+```
+
+Other useful workflows:
+
+- Log workouts with exercises, sets, reps, loads, RPE/RIR, pain, form, recovery, and notes.
+- Review the last few exposures of an exercise before choosing the next target.
+- Check whether to add reps, increase load, repeat, reduce volume, or deload.
+- Review weekly hard sets, fatigue signals, and readiness trends.
+- Apply pain and form guardrails before progressing.
+- Export context before asking an agent for a training decision.
+
+## Installation
+
+### For humans
+
+Install from source:
 
 ```bash
 git clone https://github.com/Sergio-CVM00/training-cli.git
@@ -54,7 +90,9 @@ You can copy it somewhere on your `PATH`, or run it through Cargo while developi
 cargo run -- --help
 ```
 
-## Give this to your agent
+### For agents
+
+Agents can use the CLI directly and can also install the repo skills from `skills/` into the active agent harness.
 
 Ask your coding agent to run this if you want it to install `training-cli` from GitHub:
 
@@ -73,6 +111,11 @@ If `~/.local/bin` is not on your `PATH`, use the binary directly:
 ```bash
 ./target/release/training --help
 ```
+
+For agent behavior and skill installation notes, start with:
+
+- [AGENTS.md](AGENTS.md)
+- [skills/README.md](skills/README.md)
 
 ## Quick start
 
@@ -176,3 +219,14 @@ cargo build --release
 ```
 
 `cargo fmt` requires the `rustfmt` component for your Rust toolchain.
+
+## Contribute
+
+Contributions should preserve the repo's role as a local-first training memory layer:
+
+- Check [AGENTS.md](AGENTS.md) before changing CLI behavior or training data flows.
+- Do not delete or overwrite user workout data without explicit instruction.
+- Keep logs fact-based, and keep interpretations separate from logged facts.
+- Do not invent missing training history in examples, tests, docs, or agent guidance.
+- Keep pain, form, fatigue, recovery, and deload language conservative.
+- Update `skills/` docs when changing agent-facing workflows.
