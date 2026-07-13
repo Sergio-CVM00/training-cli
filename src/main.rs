@@ -1,7 +1,7 @@
 use chrono::{Duration, Local, NaiveDate};
 use clap::{Args, Parser, Subcommand};
 use rusqlite::{params, Connection, OptionalExtension, Row};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::env;
@@ -78,9 +78,26 @@ CREATE TABLE IF NOT EXISTS set_logs (
   FOREIGN KEY (exercise_log_id) REFERENCES exercise_logs(id) ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS exercise_catalog (
+  id TEXT PRIMARY KEY,
+  source_id TEXT NOT NULL UNIQUE,
+  name TEXT NOT NULL,
+  category TEXT,
+  body_part TEXT,
+  equipment TEXT,
+  target TEXT,
+  muscle_group TEXT,
+  secondary_muscles_json TEXT NOT NULL DEFAULT '[]',
+  instructions_en TEXT,
+  media_id TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_workout_sessions_date ON workout_sessions(date);
 CREATE INDEX IF NOT EXISTS idx_exercise_logs_name ON exercise_logs(exercise_name);
 CREATE INDEX IF NOT EXISTS idx_set_logs_exercise_log_id ON set_logs(exercise_log_id);
+CREATE INDEX IF NOT EXISTS idx_exercise_catalog_name ON exercise_catalog(name);
 "#;
 
 #[derive(Parser)]
@@ -99,7 +116,8 @@ enum Commands {
     Show { #[command(subcommand)] command: ShowCommand },
     Update { #[command(subcommand)] command: UpdateCommand },
     Delete { #[command(subcommand)] command: DeleteCommand },
-    Log { text: String },
+    Exercises { #[command(subcommand)] command: ExercisesCommand },
+    Log(LogArgs),
     Last { exercise: String, #[arg(long)] json: bool },
     History(HistoryArgs),
     Context { #[arg(long, default_value = "4weeks")] last: String, #[arg(long, default_value = "markdown")] format: String },
@@ -141,6 +159,13 @@ enum DeleteCommand {
     Workout { id: String, #[arg(long)] yes: bool },
     Exercise { id: String, #[arg(long)] yes: bool },
     Set { id: String, #[arg(long)] yes: bool },
+}
+
+#[derive(Subcommand)]
+enum ExercisesCommand {
+    Import(ExerciseImportArgs),
+    Search(ExerciseSearchArgs),
+    Show { query: String },
 }
 
 #[derive(Args)]
@@ -221,6 +246,28 @@ struct SetArgs {
     pain: Option<i64>,
     #[arg(long)]
     notes: Option<String>,
+}
+
+#[derive(Args)]
+struct LogArgs {
+    text: String,
+    #[arg(long, default_value = "today")]
+    workout: String,
+    #[arg(long)]
+    partial: bool,
+}
+
+#[derive(Args)]
+struct ExerciseImportArgs {
+    #[arg(long)]
+    file: PathBuf,
+}
+
+#[derive(Args)]
+struct ExerciseSearchArgs {
+    query: String,
+    #[arg(long, default_value_t = 10)]
+    limit: i64,
 }
 
 #[derive(Args)]
@@ -381,6 +428,42 @@ struct SetLog {
     updated_at: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct CatalogExercise {
+    id: String,
+    source_id: String,
+    name: String,
+    category: Option<String>,
+    body_part: Option<String>,
+    equipment: Option<String>,
+    target: Option<String>,
+    muscle_group: Option<String>,
+    secondary_muscles_json: String,
+    instructions_en: Option<String>,
+    media_id: Option<String>,
+    created_at: String,
+    updated_at: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ImportedCatalogExercise {
+    id: String,
+    name: String,
+    category: Option<String>,
+    body_part: Option<String>,
+    equipment: Option<String>,
+    target: Option<String>,
+    muscle_group: Option<String>,
+    secondary_muscles: Option<Vec<String>>,
+    instructions: Option<ImportedInstructions>,
+    media_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ImportedInstructions {
+    en: Option<String>,
+}
+
 #[derive(Clone)]
 struct Paths {
     root: PathBuf,
@@ -427,7 +510,8 @@ fn run() -> AppResult<()> {
         Commands::Show { command } => handle_show(command)?,
         Commands::Update { command } => handle_update(command)?,
         Commands::Delete { command } => handle_delete(command)?,
-        Commands::Log { text } => handle_log(&text)?,
+        Commands::Exercises { command } => handle_exercises(command)?,
+        Commands::Log(args) => handle_log(args)?,
         Commands::Last { exercise, json } => handle_last(&exercise, json)?,
         Commands::History(args) => handle_history(args)?,
         Commands::Context { last, format } => handle_context(&last, &format)?,
@@ -491,7 +575,7 @@ fn handle_add(command: AddCommand) -> AppResult<()> {
             println!("Created exercise {}: {}", exercise.id, exercise.exercise_name);
         }
         AddCommand::Set(args) => {
-            let exercise = get_exercise_by_id(&conn, &args.exercise)?.or_else(|| get_today_exercise(&conn, &args.exercise).ok().flatten()).ok_or_else(|| format!("Exercise \"{}\" was not found in today's workout.", args.exercise))?;
+            let exercise = resolve_set_exercise(&conn, &args.exercise)?;
             let set = create_set(&conn, &exercise.id, &set_args_to_input(args)?)?;
             println!("Created set {}: {}", set.id, format_set(&set));
         }
@@ -650,16 +734,58 @@ fn handle_delete(command: DeleteCommand) -> AppResult<()> {
     Ok(())
 }
 
-fn handle_log(text: &str) -> AppResult<()> {
+fn handle_exercises(command: ExercisesCommand) -> AppResult<()> {
     let paths = ensure_ready()?;
-    let conn = open_db(&paths)?;
-    let (parsed, errors) = parse_log_text(text);
-    let workout = get_or_create_today_workout(&conn, &paths)?;
+    let mut conn = open_db(&paths)?;
+    match command {
+        ExercisesCommand::Import(args) => {
+            let text = fs::read_to_string(&args.file).map_err(fs_err)?;
+            let items: Vec<ImportedCatalogExercise> = serde_json::from_str(&text).map_err(json_err)?;
+            let count = import_catalog_exercises(&mut conn, items)?;
+            println!("Imported {count} catalog exercises");
+        }
+        ExercisesCommand::Search(args) => {
+            let items = search_catalog_exercises(&conn, &args.query, args.limit)?;
+            if items.is_empty() {
+                println!("No catalog exercises found.");
+            }
+            for item in items {
+                println!("{}", format_catalog_summary(&item));
+            }
+        }
+        ExercisesCommand::Show { query } => {
+            let item = find_catalog_exercise(&conn, &query)?
+                .ok_or_else(|| format!("Catalog exercise not found: {query}"))?;
+            println!("{}", format_catalog_details(&item));
+        }
+    }
+    Ok(())
+}
+
+fn handle_log(args: LogArgs) -> AppResult<()> {
+    let paths = ensure_ready()?;
+    let mut conn = open_db(&paths)?;
+    let (parsed, errors) = parse_log_text(&args.text);
+    if !errors.is_empty() && !args.partial {
+        return Err(format!("Log was not saved because it contains invalid input:\n{}", errors.join("\n")));
+    }
+    if parsed.is_empty() {
+        let detail = if errors.is_empty() {
+            "No valid sets found in log input.".to_string()
+        } else {
+            format!("No valid sets found in log input:\n{}", errors.join("\n"))
+        };
+        return Err(detail);
+    }
+
+    let tx = conn.transaction().map_err(db_err)?;
+    let workout = get_or_create_log_workout(&tx, &paths, &args.workout)?;
     let mut saved: Vec<(Exercise, Vec<SetLog>)> = Vec::new();
     for item in parsed {
-        let exercise = get_exercise_in_workout(&conn, &workout.id, &item.name)?.unwrap_or_else(|| {
-            create_exercise(&conn, &workout.id, &item.name, None, None, None, None).expect("exercise creation")
-        });
+        let exercise = match get_exercise_in_workout(&tx, &workout.id, &item.name)? {
+            Some(exercise) => exercise,
+            None => create_exercise_from_log_name(&tx, &workout.id, &item.name)?,
+        };
         let mut sets = Vec::new();
         for parsed_set in item.sets {
             let input = SetInput {
@@ -676,10 +802,11 @@ fn handle_log(text: &str) -> AppResult<()> {
                 notes: None,
             };
             validate_set_input(&input)?;
-            sets.push(create_set(&conn, &exercise.id, &input)?);
+            sets.push(create_set(&tx, &exercise.id, &input)?);
         }
         saved.push((exercise, sets));
     }
+    tx.commit().map_err(db_err)?;
     println!("Saved workout log\n");
     println!("{}\n", format_workout_header(&workout));
     for (exercise, sets) in saved {
@@ -730,6 +857,16 @@ fn handle_history(args: HistoryArgs) -> AppResult<()> {
     println!("{} - History\n", args.exercise);
     let items = history(&conn, &args.exercise, args.last.as_deref(), args.from_date.as_deref(), args.to_date.as_deref())?;
     if items.is_empty() {
+        if !exercise_name_exists(&conn, &args.exercise)? {
+            let matches = exercise_name_suggestions(&conn, &args.exercise)?;
+            if !matches.is_empty() {
+                println!("No exact match found for \"{}\". Did you mean:", args.exercise);
+                for (index, item) in matches.iter().enumerate() {
+                    println!("{}. {item}", index + 1);
+                }
+                return Err("no exact exercise match".to_string());
+            }
+        }
         println!("No history found.");
     }
     for (workout, _exercise, sets) in items {
@@ -772,6 +909,7 @@ fn handle_export(format: &str, out: Option<PathBuf>) -> AppResult<()> {
         "workout_sessions": all_workouts(&conn)?,
         "exercise_logs": all_exercises(&conn)?,
         "set_logs": all_sets(&conn)?,
+        "exercise_catalog": all_catalog_exercises(&conn)?,
     });
     fs::write(&target, serde_json::to_string_pretty(&data).map_err(json_err)? + "\n").map_err(fs_err)?;
     println!("Exported to {}", target.display());
@@ -859,6 +997,25 @@ fn migrate_schema(conn: &Connection) -> AppResult<()> {
     add_column_if_missing(conn, "workout_sessions", "max_heart_rate_bpm", "INTEGER")?;
     add_column_if_missing(conn, "workout_sessions", "calories", "INTEGER")?;
     add_column_if_missing(conn, "workout_sessions", "steps", "INTEGER")?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS exercise_catalog (
+          id TEXT PRIMARY KEY,
+          source_id TEXT NOT NULL UNIQUE,
+          name TEXT NOT NULL,
+          category TEXT,
+          body_part TEXT,
+          equipment TEXT,
+          target TEXT,
+          muscle_group TEXT,
+          secondary_muscles_json TEXT NOT NULL DEFAULT '[]',
+          instructions_en TEXT,
+          media_id TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_exercise_catalog_name ON exercise_catalog(name);",
+    )
+    .map_err(db_err)?;
     Ok(())
 }
 
@@ -927,6 +1084,15 @@ fn create_exercise(conn: &Connection, workout_id: &str, name: &str, category: Op
     get_exercise_by_id(conn, &id)?.ok_or_else(|| "created exercise could not be read".to_string())
 }
 
+fn create_exercise_from_log_name(conn: &Connection, workout_id: &str, name: &str) -> AppResult<Exercise> {
+    if let Some(catalog) = find_catalog_exercise(conn, name)? {
+        let category = catalog_category_to_log_category(catalog.category.as_deref().or(catalog.body_part.as_deref()));
+        let muscle_group = catalog_muscle_group(&catalog);
+        return create_exercise(conn, workout_id, name, category, muscle_group, catalog.equipment, None);
+    }
+    create_exercise(conn, workout_id, name, None, None, None, None)
+}
+
 fn create_set(conn: &Connection, exercise_id: &str, input: &SetInput) -> AppResult<SetLog> {
     validate_set_input(input)?;
     let id = Uuid::new_v4().to_string();
@@ -965,9 +1131,16 @@ fn get_or_create_today_workout(conn: &Connection, paths: &Paths) -> AppResult<Wo
     })
 }
 
+fn get_or_create_log_workout(conn: &Connection, paths: &Paths, identifier: &str) -> AppResult<Workout> {
+    if identifier == "today" {
+        return get_or_create_today_workout(conn, paths);
+    }
+    get_workout(conn, identifier)?.ok_or_else(|| format!("Workout not found: {identifier}"))
+}
+
 fn get_workout(conn: &Connection, identifier: &str) -> AppResult<Option<Workout>> {
     if identifier == "today" {
-        return conn.query_row("SELECT * FROM workout_sessions WHERE date = ? ORDER BY created_at LIMIT 1", params![today()], workout_from_row).optional().map_err(db_err);
+        return conn.query_row("SELECT * FROM workout_sessions WHERE date = ? ORDER BY created_at DESC, id DESC LIMIT 1", params![today()], workout_from_row).optional().map_err(db_err);
     }
     conn.query_row("SELECT * FROM workout_sessions WHERE id = ?", params![identifier], workout_from_row).optional().map_err(db_err)
 }
@@ -997,12 +1170,28 @@ fn get_exercise_by_id(conn: &Connection, id: &str) -> AppResult<Option<Exercise>
     conn.query_row("SELECT * FROM exercise_logs WHERE id = ?", params![id], exercise_from_row).optional().map_err(db_err)
 }
 
-fn get_today_exercise(conn: &Connection, name: &str) -> AppResult<Option<Exercise>> {
-    conn.query_row(
-        "SELECT e.* FROM exercise_logs e JOIN workout_sessions w ON w.id = e.workout_id WHERE w.date = ? AND lower(e.exercise_name) = lower(?) ORDER BY e.sort_order DESC LIMIT 1",
-        params![today(), name],
-        exercise_from_row,
-    ).optional().map_err(db_err)
+fn resolve_set_exercise(conn: &Connection, identifier: &str) -> AppResult<Exercise> {
+    if let Some(exercise) = get_exercise_by_id(conn, identifier)? {
+        return Ok(exercise);
+    }
+    let matches = today_exercise_matches(conn, identifier)?;
+    match matches.len() {
+        0 => Err(format!("Exercise \"{identifier}\" was not found in today's workout.")),
+        1 => Ok(matches.into_iter().next().unwrap()),
+        _ => Err(format!(
+            "Exercise \"{identifier}\" is ambiguous today. Pass an exercise id instead."
+        )),
+    }
+}
+
+fn today_exercise_matches(conn: &Connection, name: &str) -> AppResult<Vec<Exercise>> {
+    let mut stmt = conn.prepare(
+        "SELECT e.* FROM exercise_logs e JOIN workout_sessions w ON w.id = e.workout_id WHERE w.date = ? AND lower(e.exercise_name) = lower(?) ORDER BY w.created_at DESC, e.sort_order DESC",
+    ).map_err(db_err)?;
+    stmt.query_map(params![today(), name], exercise_from_row)
+        .map_err(db_err)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(db_err)
 }
 
 fn get_exercise_in_workout(conn: &Connection, workout_id: &str, name: &str) -> AppResult<Option<Exercise>> {
@@ -1042,6 +1231,149 @@ fn all_sets(conn: &Connection) -> AppResult<Vec<SetLog>> {
     stmt.query_map([], set_from_row).map_err(db_err)?.collect::<Result<Vec<_>, _>>().map_err(db_err)
 }
 
+fn import_catalog_exercises(conn: &mut Connection, items: Vec<ImportedCatalogExercise>) -> AppResult<usize> {
+    let tx = conn.transaction().map_err(db_err)?;
+    let now = now_iso();
+    let mut count = 0;
+    for item in items {
+        if item.id.trim().is_empty() || item.name.trim().is_empty() {
+            continue;
+        }
+        let secondary_muscles = serde_json::to_string(&item.secondary_muscles.unwrap_or_default()).map_err(json_err)?;
+        let id = Uuid::new_v4().to_string();
+        tx.execute(
+            "INSERT INTO exercise_catalog (id, source_id, name, category, body_part, equipment, target, muscle_group, secondary_muscles_json, instructions_en, media_id, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(source_id) DO UPDATE SET
+               name = excluded.name,
+               category = excluded.category,
+               body_part = excluded.body_part,
+               equipment = excluded.equipment,
+               target = excluded.target,
+               muscle_group = excluded.muscle_group,
+               secondary_muscles_json = excluded.secondary_muscles_json,
+               instructions_en = excluded.instructions_en,
+               media_id = excluded.media_id,
+               updated_at = excluded.updated_at",
+            params![
+                id,
+                item.id.trim(),
+                item.name.trim(),
+                item.category,
+                item.body_part,
+                item.equipment,
+                item.target,
+                item.muscle_group,
+                secondary_muscles,
+                item.instructions.and_then(|instructions| instructions.en),
+                item.media_id,
+                now,
+                now
+            ],
+        )
+        .map_err(db_err)?;
+        count += 1;
+    }
+    tx.commit().map_err(db_err)?;
+    Ok(count)
+}
+
+fn all_catalog_exercises(conn: &Connection) -> AppResult<Vec<CatalogExercise>> {
+    let mut stmt = conn.prepare("SELECT * FROM exercise_catalog ORDER BY name").map_err(db_err)?;
+    stmt.query_map([], catalog_exercise_from_row)
+        .map_err(db_err)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(db_err)
+}
+
+fn escape_like_pattern(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
+}
+
+fn search_catalog_exercises(conn: &Connection, query: &str, limit: i64) -> AppResult<Vec<CatalogExercise>> {
+    let pattern = format!("%{}%", escape_like_pattern(&query.trim().to_lowercase()));
+    let mut stmt = conn
+        .prepare(
+            "SELECT * FROM exercise_catalog
+             WHERE lower(name) LIKE ?1 ESCAPE '\\' OR lower(category) LIKE ?1 ESCAPE '\\' OR lower(equipment) LIKE ?1 ESCAPE '\\' OR lower(target) LIKE ?1 ESCAPE '\\'
+             ORDER BY name, source_id
+             LIMIT ?2",
+        )
+        .map_err(db_err)?;
+    stmt.query_map(params![pattern, limit.max(1)], catalog_exercise_from_row)
+        .map_err(db_err)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(db_err)
+}
+
+fn find_catalog_exercise(conn: &Connection, query: &str) -> AppResult<Option<CatalogExercise>> {
+    conn.query_row(
+        "SELECT * FROM exercise_catalog WHERE source_id = ?1 OR lower(name) = lower(?1) ORDER BY (source_id = ?1) DESC, name, source_id LIMIT 1",
+        params![query],
+        catalog_exercise_from_row,
+    )
+    .optional()
+    .map_err(db_err)
+}
+
+fn catalog_category_to_log_category(value: Option<&str>) -> Option<String> {
+    let value = value?.trim().to_lowercase();
+    let category = match value.as_str() {
+        "chest" | "shoulders" => "push",
+        "back" | "lower arms" => "pull",
+        "upper legs" | "lower legs" => "legs",
+        "waist" => "core",
+        "cardio" => "cardio",
+        "mobility" => "mobility",
+        _ => "other",
+    };
+    Some(category.to_string())
+}
+
+fn catalog_muscle_group(catalog: &CatalogExercise) -> Option<String> {
+    let mut items = Vec::new();
+    for value in [&catalog.target, &catalog.muscle_group].into_iter().flatten() {
+        push_unique(&mut items, value);
+    }
+    if let Ok(values) = serde_json::from_str::<Vec<String>>(&catalog.secondary_muscles_json) {
+        for value in values {
+            push_unique(&mut items, &value);
+        }
+    }
+    if items.is_empty() {
+        None
+    } else {
+        Some(items.join(","))
+    }
+}
+
+fn push_unique(items: &mut Vec<String>, value: &str) {
+    let value = value.trim();
+    if !value.is_empty() && !items.iter().any(|item| item.eq_ignore_ascii_case(value)) {
+        items.push(value.to_string());
+    }
+}
+
+fn exercise_name_exists(conn: &Connection, name: &str) -> AppResult<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM exercise_logs WHERE lower(exercise_name) = lower(?))",
+        params![name],
+        |row| row.get::<_, bool>(0),
+    )
+    .map_err(db_err)
+}
+
+fn exercise_name_suggestions(conn: &Connection, name: &str) -> AppResult<Vec<String>> {
+    let mut stmt = conn.prepare("SELECT DISTINCT exercise_name FROM exercise_logs ORDER BY exercise_name").map_err(db_err)?;
+    let names = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(db_err)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(db_err)?;
+    let lowered = name.to_lowercase();
+    Ok(names.into_iter().filter(|candidate| candidate.to_lowercase().contains(&lowered)).collect())
+}
+
 fn last_exercise(conn: &Connection, name: &str) -> AppResult<LastResult> {
     let mut stmt = conn.prepare(
         "SELECT e.*, w.id, w.date, w.title, w.type, w.bodyweight_kg, w.duration_min, w.distance_km, w.speed_kmh, w.pace_min_per_km, w.elevation_gain_m, w.avg_heart_rate_bpm, w.max_heart_rate_bpm, w.calories, w.steps, w.perceived_energy, w.perceived_recovery, w.notes, w.created_at, w.updated_at
@@ -1054,11 +1386,7 @@ fn last_exercise(conn: &Connection, name: &str) -> AppResult<LastResult> {
             return Ok(LastResult::Found { exercise: exercise.clone(), workout: workout.clone(), sets: sets_for_exercise(conn, &exercise.id)? });
         }
     }
-    let mut names: Vec<String> = rows.iter().map(|(exercise, _)| exercise.exercise_name.clone()).collect();
-    names.sort();
-    names.dedup();
-    let lowered = name.to_lowercase();
-    let matches: Vec<String> = names.into_iter().filter(|candidate| candidate.to_lowercase().contains(&lowered)).collect();
+    let matches = exercise_name_suggestions(conn, name)?;
     if matches.is_empty() { Ok(LastResult::None) } else { Ok(LastResult::Matches(matches)) }
 }
 
@@ -1351,6 +1679,24 @@ fn set_from_row(row: &Row<'_>) -> rusqlite::Result<SetLog> {
     })
 }
 
+fn catalog_exercise_from_row(row: &Row<'_>) -> rusqlite::Result<CatalogExercise> {
+    Ok(CatalogExercise {
+        id: row.get("id")?,
+        source_id: row.get("source_id")?,
+        name: row.get("name")?,
+        category: row.get("category")?,
+        body_part: row.get("body_part")?,
+        equipment: row.get("equipment")?,
+        target: row.get("target")?,
+        muscle_group: row.get("muscle_group")?,
+        secondary_muscles_json: row.get("secondary_muscles_json")?,
+        instructions_en: row.get("instructions_en")?,
+        media_id: row.get("media_id")?,
+        created_at: row.get("created_at")?,
+        updated_at: row.get("updated_at")?,
+    })
+}
+
 fn exercise_from_join_row(row: &Row<'_>) -> rusqlite::Result<Exercise> {
     Ok(Exercise {
         id: row.get(0)?,
@@ -1417,6 +1763,55 @@ fn format_workout_details(conn: &Connection, workout: &Workout) -> AppResult<Str
     Ok(lines.join("\n"))
 }
 
+fn format_catalog_summary(exercise: &CatalogExercise) -> String {
+    let mut parts = vec![format!("{} {}", exercise.source_id, exercise.name)];
+    if let Some(category) = &exercise.category {
+        parts.push(format!("category={category}"));
+    }
+    if let Some(equipment) = &exercise.equipment {
+        parts.push(format!("equipment={equipment}"));
+    }
+    if let Some(target) = &exercise.target {
+        parts.push(format!("target={target}"));
+    }
+    parts.join(" | ")
+}
+
+fn format_catalog_details(exercise: &CatalogExercise) -> String {
+    let mut lines = vec![
+        exercise.name.clone(),
+        format!("Source ID: {}", exercise.source_id),
+    ];
+    if let Some(category) = &exercise.category {
+        lines.push(format!("Category: {category}"));
+    }
+    if let Some(body_part) = &exercise.body_part {
+        lines.push(format!("Body part: {body_part}"));
+    }
+    if let Some(equipment) = &exercise.equipment {
+        lines.push(format!("Equipment: {equipment}"));
+    }
+    if let Some(target) = &exercise.target {
+        lines.push(format!("Target: {target}"));
+    }
+    if let Some(muscle_group) = &exercise.muscle_group {
+        lines.push(format!("Muscle group: {muscle_group}"));
+    }
+    if let Ok(secondary) = serde_json::from_str::<Vec<String>>(&exercise.secondary_muscles_json) {
+        if !secondary.is_empty() {
+            lines.push(format!("Secondary muscles: {}", secondary.join(", ")));
+        }
+    }
+    if let Some(media_id) = &exercise.media_id {
+        lines.push(format!("Media ID: {media_id}"));
+    }
+    if let Some(instructions) = &exercise.instructions_en {
+        lines.push("Instructions:".to_string());
+        lines.push(instructions.clone());
+    }
+    lines.join("\n")
+}
+
 fn format_set(set: &SetLog) -> String {
     let mut text = match (set.weight_kg, set.reps) {
         (Some(weight), Some(reps)) => format!("{}kg x {}", trim_float(weight), reps),
@@ -1424,14 +1819,32 @@ fn format_set(set: &SetLog) -> String {
         (None, Some(reps)) => format!("x {reps}"),
         (None, None) => set.set_type.clone(),
     };
+    if set.set_type != "working" && (set.weight_kg.is_some() || set.reps.is_some()) {
+        text.push_str(&format!(" type={}", set.set_type));
+    }
+    if let Some(target_reps) = set.target_reps {
+        text.push_str(&format!(" target={target_reps}"));
+    }
     if let Some(rpe) = set.rpe {
         text.push_str(&format!(" @ RPE {}", trim_float(rpe)));
+    }
+    if let Some(rir) = set.rir {
+        text.push_str(&format!(" RIR {}", trim_float(rir)));
+    }
+    if let Some(rest_sec) = set.rest_sec {
+        text.push_str(&format!(" rest={rest_sec}s"));
+    }
+    if let Some(tempo) = &set.tempo {
+        text.push_str(&format!(" tempo={tempo}"));
     }
     if let Some(pain) = set.pain_rating {
         text.push_str(&format!(" pain={pain}"));
     }
     if let Some(form) = set.form_rating {
         text.push_str(&format!(" form={form}"));
+    }
+    if let Some(notes) = &set.notes {
+        text.push_str(&format!(" notes=\"{notes}\""));
     }
     text
 }
@@ -1445,8 +1858,34 @@ fn format_set_value(set: &Value) -> String {
         (None, Some(reps)) => format!("x {reps}"),
         (None, None) => set["set_type"].as_str().unwrap_or("set").to_string(),
     };
+    if let Some(set_type) = set["set_type"].as_str().filter(|value| *value != "working") {
+        if weight.is_some() || reps.is_some() {
+            text.push_str(&format!(" type={set_type}"));
+        }
+    }
+    if let Some(target_reps) = set["target_reps"].as_i64() {
+        text.push_str(&format!(" target={target_reps}"));
+    }
     if let Some(rpe) = set["rpe"].as_f64() {
         text.push_str(&format!(" @ RPE {}", trim_float(rpe)));
+    }
+    if let Some(rir) = set["rir"].as_f64() {
+        text.push_str(&format!(" RIR {}", trim_float(rir)));
+    }
+    if let Some(rest_sec) = set["rest_sec"].as_i64() {
+        text.push_str(&format!(" rest={rest_sec}s"));
+    }
+    if let Some(tempo) = set["tempo"].as_str() {
+        text.push_str(&format!(" tempo={tempo}"));
+    }
+    if let Some(pain) = set["pain_rating"].as_i64() {
+        text.push_str(&format!(" pain={pain}"));
+    }
+    if let Some(form) = set["form_rating"].as_i64() {
+        text.push_str(&format!(" form={form}"));
+    }
+    if let Some(notes) = set["notes"].as_str() {
+        text.push_str(&format!(" notes=\"{notes}\""));
     }
     text
 }
@@ -1666,7 +2105,7 @@ fn today() -> String {
 }
 
 fn now_iso() -> String {
-    Local::now().format("%Y-%m-%dT%H:%M:%S").to_string()
+    Local::now().format("%Y-%m-%dT%H:%M:%S%.3f").to_string()
 }
 
 fn split_csv(value: String) -> String {
