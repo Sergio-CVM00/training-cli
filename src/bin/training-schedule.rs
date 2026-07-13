@@ -41,74 +41,32 @@ enum Command {
     Init,
     Add(AddArgs),
     List(ListArgs),
-    Update(UpdateArgs),
     Cancel { id: String },
-    Start {
-        id: String,
-        #[arg(long)]
-        at: Option<String>,
-    },
+    Start { id: String, #[arg(long)] at: Option<String> },
     Complete {
         id: String,
-        #[arg(long)]
-        at: Option<String>,
-        #[arg(long)]
-        workout_id: Option<String>,
+        #[arg(long)] at: Option<String>,
+        #[arg(long)] workout_id: Option<String>,
     },
-    Context(ContextArgs),
+    Context { #[arg(long)] at: Option<String> },
 }
 
 #[derive(Args)]
 struct AddArgs {
-    #[arg(long)]
-    starts_at: String,
-    #[arg(long)]
-    title: String,
-    #[arg(long, default_value = "gym")]
-    r#type: String,
-    #[arg(long)]
-    duration_min: Option<i64>,
-    #[arg(long)]
-    target_rpe: Option<f64>,
-    #[arg(long, value_delimiter = ',')]
-    focus: Vec<String>,
-    #[arg(long)]
-    notes: Option<String>,
+    #[arg(long)] starts_at: String,
+    #[arg(long)] title: String,
+    #[arg(long, default_value = "gym")] r#type: String,
+    #[arg(long)] duration_min: Option<i64>,
+    #[arg(long)] target_rpe: Option<f64>,
+    #[arg(long, value_delimiter = ',')] focus: Vec<String>,
+    #[arg(long)] notes: Option<String>,
 }
 
 #[derive(Args)]
 struct ListArgs {
-    #[arg(long)]
-    from: Option<String>,
-    #[arg(long)]
-    to: Option<String>,
-    #[arg(long)]
-    status: Option<String>,
-}
-
-#[derive(Args)]
-struct UpdateArgs {
-    id: String,
-    #[arg(long)]
-    starts_at: Option<String>,
-    #[arg(long)]
-    title: Option<String>,
-    #[arg(long)]
-    r#type: Option<String>,
-    #[arg(long)]
-    duration_min: Option<i64>,
-    #[arg(long)]
-    target_rpe: Option<f64>,
-    #[arg(long, value_delimiter = ',')]
-    focus: Option<Vec<String>>,
-    #[arg(long)]
-    notes: Option<String>,
-}
-
-#[derive(Args)]
-struct ContextArgs {
-    #[arg(long)]
-    at: Option<String>,
+    #[arg(long)] from: Option<String>,
+    #[arg(long)] to: Option<String>,
+    #[arg(long)] status: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -131,8 +89,8 @@ struct Session {
 }
 
 fn main() {
-    if let Err(error) = run() {
-        println!("{}", json!({"ok": false, "error": {"code": "SCHEDULE_ERROR", "message": error}}));
+    if let Err(message) = run() {
+        println!("{}", json!({"ok": false, "error": {"code": "SCHEDULE_ERROR", "message": message}}));
         std::process::exit(1);
     }
 }
@@ -140,40 +98,33 @@ fn main() {
 fn run() -> AppResult<()> {
     let cli = Cli::parse();
     let conn = open_db()?;
-    match cli.command {
-        Command::Init => output(json!({"initialized": true, "database": database_path()})),
-        Command::Add(args) => {
-            validate_add(&args)?;
-            let session = add_session(&conn, args)?;
-            output(json!({"session": session}));
-        }
-        Command::List(args) => output(json!({"sessions": list_sessions(&conn, args)?})),
-        Command::Update(args) => output(json!({"session": update_session(&conn, args)?})),
-        Command::Cancel { id } => output(json!({"session": transition(&conn, &id, "cancelled", None, None)?})),
+    let data = match cli.command {
+        Command::Init => json!({"initialized": true, "database": database_path()}),
+        Command::Add(args) => json!({"session": add_session(&conn, args)?}),
+        Command::List(args) => json!({"sessions": list_sessions(&conn, args)?}),
+        Command::Cancel { id } => json!({"session": transition(&conn, &id, "cancelled", None, None, None)?}),
         Command::Start { id, at } => {
-            let at = parse_or_now(at.as_deref())?;
-            output(json!({"session": transition(&conn, &id, "in_progress", Some(at.to_rfc3339()), None)?}));
+            let instant = parse_or_now(at.as_deref())?.to_rfc3339();
+            json!({"session": transition(&conn, &id, "in_progress", Some(instant), None, None)?})
         }
         Command::Complete { id, at, workout_id } => {
-            let at = parse_or_now(at.as_deref())?;
-            output(json!({"session": transition(&conn, &id, "completed", None, Some((at.to_rfc3339(), workout_id)))?}));
+            let instant = parse_or_now(at.as_deref())?.to_rfc3339();
+            json!({"session": transition(&conn, &id, "completed", None, Some(instant), workout_id)?})
         }
-        Command::Context(args) => output(context(&conn, parse_or_now(args.at.as_deref())?)?),
-    }
+        Command::Context { at } => context(&conn, parse_or_now(at.as_deref())?)?,
+    };
+    println!("{}", json!({"ok": true, "data": data}));
     Ok(())
 }
 
-fn output(data: serde_json::Value) {
-    println!("{}", json!({"ok": true, "data": data}));
-}
-
 fn database_path() -> String {
+    let cwd = env::current_dir().unwrap_or_default();
     let root = if env::var("TRAINING_CLI_LOCAL").ok().as_deref() == Some("1") {
-        env::current_dir().unwrap_or_default().join(".training")
+        cwd.join(".training")
     } else if let Ok(home) = env::var("TRAINING_CLI_HOME") {
         PathBuf::from(home)
-    } else if env::current_dir().unwrap_or_default().join(".training").exists() {
-        env::current_dir().unwrap_or_default().join(".training")
+    } else if cwd.join(".training").exists() {
+        cwd.join(".training")
     } else {
         PathBuf::from(env::var("HOME").unwrap_or_else(|_| ".".into())).join(".training-cli")
     };
@@ -182,27 +133,20 @@ fn database_path() -> String {
 
 fn open_db() -> AppResult<Connection> {
     let path = PathBuf::from(database_path());
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
+    if let Some(parent) = path.parent() { fs::create_dir_all(parent).map_err(|e| e.to_string())?; }
     let conn = Connection::open(path).map_err(|e| e.to_string())?;
     conn.pragma_update(None, "foreign_keys", "ON").map_err(|e| e.to_string())?;
     conn.execute_batch(SCHEMA).map_err(|e| e.to_string())?;
     Ok(conn)
 }
 
-fn validate_add(args: &AddArgs) -> AppResult<()> {
-    parse_time(&args.starts_at)?;
+fn add_session(conn: &Connection, args: AddArgs) -> AppResult<Session> {
+    let starts_at = parse_time(&args.starts_at)?.to_rfc3339();
     if args.title.trim().is_empty() { return Err("title is required".into()); }
     if args.duration_min.is_some_and(|v| v <= 0) { return Err("duration-min must be positive".into()); }
     if args.target_rpe.is_some_and(|v| !(1.0..=10.0).contains(&v)) { return Err("target-rpe must be between 1 and 10".into()); }
-    Ok(())
-}
-
-fn add_session(conn: &Connection, args: AddArgs) -> AppResult<Session> {
     let id = Uuid::new_v4().to_string();
     let now = Utc::now().to_rfc3339();
-    let starts_at = parse_time(&args.starts_at)?.to_rfc3339();
     let focus = serde_json::to_string(&args.focus).map_err(|e| e.to_string())?;
     conn.execute(
         "INSERT INTO scheduled_sessions (id,title,type,focus_json,status,planned_start_at,planned_duration_min,target_rpe,notes,created_at,updated_at) VALUES (?,?,?,?, 'planned',?,?,?,?,?,?)",
@@ -222,52 +166,34 @@ fn list_sessions(conn: &Connection, args: ListArgs) -> AppResult<Vec<Session>> {
         .collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
 }
 
-fn update_session(conn: &Connection, args: UpdateArgs) -> AppResult<Session> {
-    let current = get_session(conn, &args.id)?.ok_or_else(|| format!("session not found: {}", args.id))?;
-    if current.status != "planned" { return Err("only planned sessions can be updated".into()); }
-    let starts_at = match args.starts_at { Some(v) => parse_time(&v)?.to_rfc3339(), None => current.planned_start_at };
-    let duration = args.duration_min.or(current.planned_duration_min);
-    if duration.is_some_and(|v| v <= 0) { return Err("duration-min must be positive".into()); }
-    let target_rpe = args.target_rpe.or(current.target_rpe);
-    if target_rpe.is_some_and(|v| !(1.0..=10.0).contains(&v)) { return Err("target-rpe must be between 1 and 10".into()); }
-    let focus = serde_json::to_string(&args.focus.unwrap_or(current.focus)).map_err(|e| e.to_string())?;
-    conn.execute(
-        "UPDATE scheduled_sessions SET title=?, type=?, focus_json=?, planned_start_at=?, planned_duration_min=?, target_rpe=?, notes=?, updated_at=? WHERE id=?",
-        params![args.title.unwrap_or(current.title), args.r#type.unwrap_or(current.session_type), focus, starts_at, duration, target_rpe, args.notes.or(current.notes), Utc::now().to_rfc3339(), args.id],
-    ).map_err(|e| e.to_string())?;
-    get_session(conn, &args.id)?.ok_or_else(|| "updated session could not be read".into())
-}
-
-fn transition(conn: &Connection, id: &str, status: &str, start: Option<String>, completion: Option<(String, Option<String>)>) -> AppResult<Session> {
-    validate_status(status)?;
+fn transition(conn: &Connection, id: &str, next: &str, start: Option<String>, end: Option<String>, workout_id: Option<String>) -> AppResult<Session> {
     let current = get_session(conn, id)?.ok_or_else(|| format!("session not found: {id}"))?;
-    match (current.status.as_str(), status) {
-        ("planned", "in_progress" | "cancelled") | ("in_progress", "completed") | ("planned", "completed") => {}
-        _ => return Err(format!("invalid transition: {} -> {status}", current.status)),
+    match (current.status.as_str(), next) {
+        ("planned", "in_progress" | "cancelled" | "completed") | ("in_progress", "completed") => {}
+        _ => return Err(format!("invalid transition: {} -> {next}", current.status)),
     }
-    let (end, workout_id) = completion.map(|v| (Some(v.0), v.1)).unwrap_or((None, None));
     conn.execute(
         "UPDATE scheduled_sessions SET status=?, actual_start_at=COALESCE(?,actual_start_at), actual_end_at=COALESCE(?,actual_end_at), workout_id=COALESCE(?,workout_id), updated_at=? WHERE id=?",
-        params![status, start, end, workout_id, Utc::now().to_rfc3339(), id],
+        params![next, start, end, workout_id, Utc::now().to_rfc3339(), id],
     ).map_err(|e| e.to_string())?;
-    get_session(conn, id)?.ok_or_else(|| "transitioned session could not be read".into())
+    get_session(conn, id)?.ok_or_else(|| "updated session could not be read".into())
 }
 
 fn context(conn: &Connection, at: DateTime<FixedOffset>) -> AppResult<serde_json::Value> {
     let instant = at.to_rfc3339();
-    let current = query_one(conn, "status = 'in_progress'", "actual_start_at DESC")?;
-    let previous = query_one(conn, "status = 'completed' AND actual_end_at <= ?1", "actual_end_at DESC", Some(&instant))?;
-    let next = query_one(conn, "status = 'planned' AND planned_start_at >= ?1", "planned_start_at ASC", Some(&instant))?;
-    let minutes_until_start = next.as_ref().map(|s| minutes_between(&at, &parse_time(&s.planned_start_at).unwrap()));
-    let minutes_since_end = previous.as_ref().and_then(|s| s.actual_end_at.as_deref()).map(|v| minutes_between(&parse_time(v).unwrap(), &at));
+    let current = query_session(conn, "status='in_progress'", "actual_start_at DESC", None)?;
+    let previous = query_session(conn, "status='completed' AND actual_end_at <= ?1", "actual_end_at DESC", Some(&instant))?;
+    let next = query_session(conn, "status='planned' AND planned_start_at >= ?1", "planned_start_at ASC", Some(&instant))?;
+    let until = next.as_ref().map(|s| minutes_between(&at, &parse_time(&s.planned_start_at).expect("stored timestamp must be valid")));
+    let since = previous.as_ref().and_then(|s| s.actual_end_at.as_deref()).map(|v| minutes_between(&parse_time(v).expect("stored timestamp must be valid"), &at));
     Ok(json!({
         "at": instant,
         "timezone_offset_seconds": at.offset().local_minus_utc(),
         "current_session": current,
         "previous_session": previous,
         "next_session": next,
-        "minutes_until_next_session": minutes_until_start,
-        "minutes_since_previous_session": minutes_since_end,
+        "minutes_until_next_session": until,
+        "minutes_since_previous_session": since,
         "data_completeness": {
             "has_current_session": current.is_some(),
             "has_previous_session": previous.is_some(),
@@ -278,16 +204,11 @@ fn context(conn: &Connection, at: DateTime<FixedOffset>) -> AppResult<serde_json
     }))
 }
 
-fn query_one(conn: &Connection, predicate: &str, order: &str) -> AppResult<Option<Session>> {
-    query_one(conn, predicate, order, None)
-}
-
-fn query_one(conn: &Connection, predicate: &str, order: &str, value: Option<&str>) -> AppResult<Option<Session>> {
+fn query_session(conn: &Connection, predicate: &str, order: &str, value: Option<&str>) -> AppResult<Option<Session>> {
     let sql = format!("SELECT id,title,type,focus_json,status,planned_start_at,planned_duration_min,actual_start_at,actual_end_at,target_rpe,workout_id,notes,created_at,updated_at FROM scheduled_sessions WHERE {predicate} ORDER BY {order} LIMIT 1");
-    let result = if let Some(value) = value {
-        conn.query_row(&sql, params![value], map_session)
-    } else {
-        conn.query_row(&sql, [], map_session)
+    let result = match value {
+        Some(v) => conn.query_row(&sql, params![v], map_session),
+        None => conn.query_row(&sql, [], map_session),
     };
     result.optional().map_err(|e| e.to_string())
 }
@@ -315,10 +236,7 @@ fn parse_time(value: &str) -> AppResult<DateTime<FixedOffset>> {
 }
 
 fn parse_or_now(value: Option<&str>) -> AppResult<DateTime<FixedOffset>> {
-    match value {
-        Some(v) => parse_time(v),
-        None => Ok(Local::now().fixed_offset()),
-    }
+    value.map(parse_time).unwrap_or_else(|| Ok(Local::now().fixed_offset()))
 }
 
 fn validate_status(value: &str) -> AppResult<()> {
@@ -337,15 +255,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_rfc3339_with_offset() {
-        let value = parse_time("2026-07-13T18:30:00+02:00").unwrap();
-        assert_eq!(value.offset().local_minus_utc(), 7200);
-    }
-
-    #[test]
-    fn calculates_minutes_across_offsets() {
+    fn parses_offset_and_calculates_absolute_minutes() {
         let from = parse_time("2026-07-13T17:00:00+02:00").unwrap();
         let to = parse_time("2026-07-13T17:30:00+01:00").unwrap();
+        assert_eq!(from.offset().local_minus_utc(), 7200);
         assert_eq!(minutes_between(&from, &to), 90);
     }
 
