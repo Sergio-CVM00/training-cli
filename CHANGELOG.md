@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Add idempotent `training log --command-id` receipts with conflict detection.
+- Add `training log --json` success, replay, and structured error envelopes.
+- Preserve safety context by failing on unreadable configuration instead of loading defaults.
+- Canonicalize catalog IDs to exercise names and emit UTC RFC 3339 timestamps.
+
 All notable versioned changes to this project are documented in this file.
 
 ## [Unreleased] - 2026-07-13

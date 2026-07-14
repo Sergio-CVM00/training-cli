@@ -35,7 +35,8 @@ Also run the test suite.
 - Local-first storage.
 - SQLite as default database.
 - Human-readable CLI output.
-- Machine-readable JSON output.
+- Machine-readable JSON output for the agent write seam: `training log --json --command-id <id>`.
+- Reuse a command id only for a retry of identical input; never retry a write with a new id.
 - Markdown context output for agents.
 - Simple schema.
 - Reliable CRUD.
