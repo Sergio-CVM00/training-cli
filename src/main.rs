@@ -1,4 +1,5 @@
-use chrono::{Duration, Local, NaiveDate};
+use chrono::{Duration, Local, NaiveDate, SecondsFormat, Utc};
+use clap::error::ErrorKind;
 use clap::{Args, Parser, Subcommand};
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde::{Deserialize, Serialize};
@@ -98,6 +99,14 @@ CREATE INDEX IF NOT EXISTS idx_workout_sessions_date ON workout_sessions(date);
 CREATE INDEX IF NOT EXISTS idx_exercise_logs_name ON exercise_logs(exercise_name);
 CREATE INDEX IF NOT EXISTS idx_set_logs_exercise_log_id ON set_logs(exercise_log_id);
 CREATE INDEX IF NOT EXISTS idx_exercise_catalog_name ON exercise_catalog(name);
+
+CREATE TABLE IF NOT EXISTS command_receipts (
+  command_id TEXT PRIMARY KEY,
+  command_type TEXT NOT NULL,
+  fingerprint TEXT NOT NULL,
+  result_json TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
 "#;
 
 #[derive(Parser)]
@@ -255,6 +264,10 @@ struct LogArgs {
     workout: String,
     #[arg(long)]
     partial: bool,
+    #[arg(long)]
+    command_id: Option<String>,
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Args)]
@@ -487,15 +500,51 @@ struct ParsedExercise {
     sets: Vec<ParsedSet>,
 }
 
+struct CommandReceipt {
+    command_type: String,
+    fingerprint: String,
+    result_json: String,
+}
+
 fn main() {
+    let json_output = env::args().any(|argument| argument == "--json");
     if let Err(error) = run() {
-        eprintln!("Error: {error}");
+        if json_output {
+            let code = if error.contains("already used with different input") {
+                "COMMAND_CONFLICT"
+            } else if error.to_lowercase().contains("not found") {
+                "NOT_FOUND"
+            } else {
+                "INVALID_COMMAND"
+            };
+            println!(
+                "{}",
+                serde_json::to_string(&json!({
+                    "ok": false,
+                    "error": {
+                        "code": code,
+                        "message": error,
+                        "retryable": false,
+                    }
+                }))
+                .unwrap_or_else(|_| "{\"ok\":false,\"error\":{\"code\":\"INTERNAL_ERROR\",\"message\":\"Could not serialize error\",\"retryable\":false}}".to_string())
+            );
+        } else {
+            eprintln!("Error: {error}");
+        }
         std::process::exit(1);
     }
 }
 
 fn run() -> AppResult<()> {
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(error) if matches!(error.kind(), ErrorKind::DisplayHelp | ErrorKind::DisplayVersion) => {
+            print!("{error}");
+            return Ok(());
+        }
+        Err(error) => return Err(error.to_string()),
+    };
     match cli.command {
         Commands::Init { local } => {
             let paths = init_storage(local)?;
@@ -778,7 +827,33 @@ fn handle_log(args: LogArgs) -> AppResult<()> {
         return Err(detail);
     }
 
+    let fingerprint = serde_json::to_string(&json!({
+        "command": "log",
+        "text": args.text,
+        "workout": args.workout,
+        "partial": args.partial,
+    }))
+    .map_err(json_err)?;
     let tx = conn.transaction().map_err(db_err)?;
+    if let Some(command_id) = args.command_id.as_deref() {
+        if let Some(receipt) = get_command_receipt(&tx, command_id)? {
+            if receipt.command_type != "training.log" || receipt.fingerprint != fingerprint {
+                return Err(format!(
+                    "command id {command_id} was already used with different input"
+                ));
+            }
+            let stored: Value = serde_json::from_str(&receipt.result_json).map_err(json_err)?;
+            let data = stored
+                .get("data")
+                .ok_or_else(|| "stored command receipt is missing data".to_string())?;
+            let human = stored
+                .get("human")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "stored command receipt is missing human output".to_string())?;
+            print_log_result(args.json, data, true, human)?;
+            return Ok(());
+        }
+    }
     let workout = get_or_create_log_workout(&tx, &paths, &args.workout)?;
     let mut saved: Vec<(Exercise, Vec<SetLog>)> = Vec::new();
     for item in parsed {
@@ -806,16 +881,25 @@ fn handle_log(args: LogArgs) -> AppResult<()> {
         }
         saved.push((exercise, sets));
     }
-    tx.commit().map_err(db_err)?;
-    println!("Saved workout log\n");
-    println!("{}\n", format_workout_header(&workout));
-    for (exercise, sets) in saved {
-        println!("{}", exercise.exercise_name);
-        for set in sets {
-            println!("{}. {}", set.set_number, format_set(&set));
-        }
-        println!();
+    let output = render_log_output(&workout, &saved);
+    let result = json!({
+        "workout": &workout,
+        "exercises": saved
+            .iter()
+            .map(|(exercise, sets)| json!({ "exercise": exercise, "sets": sets }))
+            .collect::<Vec<_>>(),
+    });
+    let result_json = serde_json::to_string(&json!({ "data": &result, "human": &output }))
+        .map_err(json_err)?;
+    if let Some(command_id) = args.command_id.as_deref() {
+        tx.execute(
+            "INSERT INTO command_receipts (command_id, command_type, fingerprint, result_json, created_at) VALUES (?, 'training.log', ?, ?, ?)",
+            params![command_id, fingerprint, result_json, now_iso()],
+        )
+        .map_err(db_err)?;
     }
+    tx.commit().map_err(db_err)?;
+    print_log_result(args.json, &result, false, &output)?;
     for error in errors {
         eprintln!("Warning: {error}");
     }
@@ -1016,6 +1100,16 @@ fn migrate_schema(conn: &Connection) -> AppResult<()> {
         CREATE INDEX IF NOT EXISTS idx_exercise_catalog_name ON exercise_catalog(name);",
     )
     .map_err(db_err)?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS command_receipts (
+          command_id TEXT PRIMARY KEY,
+          command_type TEXT NOT NULL,
+          fingerprint TEXT NOT NULL,
+          result_json TEXT NOT NULL,
+          created_at TEXT NOT NULL
+        );",
+    )
+    .map_err(db_err)?;
     Ok(())
 }
 
@@ -1044,7 +1138,8 @@ fn add_column_if_missing(conn: &Connection, table: &str, column: &str, kind: &st
 }
 
 fn read_config(paths: &Paths) -> AppResult<Value> {
-    let text = fs::read_to_string(&paths.config).unwrap_or_else(|_| DEFAULT_CONFIG.to_string());
+    let text = fs::read_to_string(&paths.config)
+        .map_err(|error| format!("could not read {}: {error}", paths.config.display()))?;
     let mut value: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
     for (key, default) in serde_json::from_str::<Value>(DEFAULT_CONFIG).unwrap().as_object().unwrap() {
         if value.get(key).is_none() {
@@ -1088,7 +1183,15 @@ fn create_exercise_from_log_name(conn: &Connection, workout_id: &str, name: &str
     if let Some(catalog) = find_catalog_exercise(conn, name)? {
         let category = catalog_category_to_log_category(catalog.category.as_deref().or(catalog.body_part.as_deref()));
         let muscle_group = catalog_muscle_group(&catalog);
-        return create_exercise(conn, workout_id, name, category, muscle_group, catalog.equipment, None);
+        return create_exercise(
+            conn,
+            workout_id,
+            &catalog.name,
+            category,
+            muscle_group,
+            catalog.equipment,
+            None,
+        );
     }
     create_exercise(conn, workout_id, name, None, None, None, None)
 }
@@ -1204,6 +1307,52 @@ fn get_exercise_in_workout(conn: &Connection, workout_id: &str, name: &str) -> A
 
 fn get_set(conn: &Connection, id: &str) -> AppResult<Option<SetLog>> {
     conn.query_row("SELECT * FROM set_logs WHERE id = ?", params![id], set_from_row).optional().map_err(db_err)
+}
+
+fn get_command_receipt(conn: &Connection, command_id: &str) -> AppResult<Option<CommandReceipt>> {
+    conn.query_row(
+        "SELECT command_type, fingerprint, result_json FROM command_receipts WHERE command_id = ?",
+        params![command_id],
+        |row| {
+            Ok(CommandReceipt {
+                command_type: row.get(0)?,
+                fingerprint: row.get(1)?,
+                result_json: row.get(2)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(db_err)
+}
+
+fn render_log_output(workout: &Workout, saved: &[(Exercise, Vec<SetLog>)]) -> String {
+    let mut output = format!("Saved workout log\n\n{}\n\n", format_workout_header(workout));
+    for (exercise, sets) in saved {
+        output.push_str(&exercise.exercise_name);
+        output.push('\n');
+        for set in sets {
+            output.push_str(&format!("{}. {}\n", set.set_number, format_set(set)));
+        }
+        output.push('\n');
+    }
+    output
+}
+
+fn print_log_result(json_output: bool, data: &Value, replayed: bool, human: &str) -> AppResult<()> {
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "ok": true,
+                "data": data,
+                "meta": { "replayed": replayed },
+            }))
+            .map_err(json_err)?
+        );
+    } else {
+        print!("{human}");
+    }
+    Ok(())
 }
 
 fn sets_for_exercise(conn: &Connection, exercise_id: &str) -> AppResult<Vec<SetLog>> {
@@ -2105,7 +2254,7 @@ fn today() -> String {
 }
 
 fn now_iso() -> String {
-    Local::now().format("%Y-%m-%dT%H:%M:%S%.3f").to_string()
+    Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 
 fn split_csv(value: String) -> String {

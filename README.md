@@ -137,6 +137,19 @@ Log strength work:
 training log "Bench Press: 80x8@8, 80x7@8.5, 75x9@8"
 ```
 
+Agent writes use an explicit idempotency key and JSON envelope. Reuse the key only when retrying
+the same user intent:
+
+```bash
+training log --json --command-id workout-2026-07-14-01 \
+  "Bench Press: 80x8@8, 80x7@8.5"
+```
+
+The response includes `meta.replayed`. Reusing a key with different input returns
+`COMMAND_CONFLICT` without adding sets. Administrative `add`, `update`, and `delete` commands remain
+human-operated; Hermes and `training-app` should use the idempotent log interface or the app's
+validated command surface.
+
 Log cardio:
 
 ```bash

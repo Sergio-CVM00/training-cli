@@ -127,6 +127,14 @@ fn smoke_flow_logs_queries_context_and_exports() {
 }
 
 #[test]
+fn help_is_a_successful_human_command() {
+    let home = temp_home("help");
+    let help = run(&home, &["--help"]);
+    assert!(help.status.success(), "{}", stderr(&help));
+    assert!(stdout(&help).contains("Usage: training"));
+}
+
+#[test]
 fn set_deletion_renumbers_remaining_sets() {
     let home = temp_home("renumber");
     assert!(run(&home, &["init"]).status.success());
@@ -431,6 +439,162 @@ fn shorthand_log_enriches_new_exercises_from_catalog() {
 }
 
 #[test]
+fn shorthand_log_by_catalog_id_uses_the_canonical_exercise_name() {
+    let home = temp_home("catalog-id-enrich");
+    assert!(run(&home, &["init"]).status.success());
+    let catalog = write_sample_catalog(&home);
+    assert!(run(&home, &["exercises", "import", "--file", catalog.to_str().unwrap()]).status.success());
+
+    let log = run(&home, &["log", "0001: 80x8@8"]);
+    assert!(log.status.success(), "{}", stderr(&log));
+    let data = export_json(&home, "catalog-id-enriched.json");
+    assert_eq!(data["exercise_logs"][0]["exercise_name"], "barbell bench press");
+}
+
+#[test]
+fn repeated_log_command_replays_without_duplicating_sets() {
+    let home = temp_home("idempotent-log");
+    assert!(run(&home, &["init"]).status.success());
+
+    let first = run(
+        &home,
+        &[
+            "log",
+            "--command-id",
+            "workout-command-001",
+            "Bench Press: 80x8@8",
+        ],
+    );
+    assert!(first.status.success(), "{}", stderr(&first));
+    let replay = run(
+        &home,
+        &[
+            "log",
+            "--command-id",
+            "workout-command-001",
+            "Bench Press: 80x8@8",
+        ],
+    );
+    assert!(replay.status.success(), "{}", stderr(&replay));
+    assert_eq!(stdout(&replay), stdout(&first));
+
+    let data = export_json(&home, "idempotent-log.json");
+    assert_eq!(data["workout_sessions"].as_array().unwrap().len(), 1);
+    assert_eq!(data["exercise_logs"].as_array().unwrap().len(), 1);
+    assert_eq!(data["set_logs"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn log_json_returns_a_stable_envelope_for_first_write_and_replay() {
+    let home = temp_home("json-log");
+    assert!(run(&home, &["init"]).status.success());
+    let args = [
+        "log",
+        "--json",
+        "--command-id",
+        "json-workout-001",
+        "Bench Press: 80x8@8",
+    ];
+
+    let first = run(&home, &args);
+    assert!(first.status.success(), "{}", stderr(&first));
+    let first_json: serde_json::Value = serde_json::from_str(&stdout(&first)).unwrap();
+    assert_eq!(first_json["ok"], true);
+    assert_eq!(first_json["meta"]["replayed"], false);
+    assert_eq!(first_json["data"]["exercises"][0]["exercise"]["exercise_name"], "Bench Press");
+    assert!(first_json["data"]["workout"]["created_at"]
+        .as_str()
+        .unwrap()
+        .ends_with('Z'));
+
+    let replay = run(&home, &args);
+    assert!(replay.status.success(), "{}", stderr(&replay));
+    let replay_json: serde_json::Value = serde_json::from_str(&stdout(&replay)).unwrap();
+    assert_eq!(replay_json["ok"], true);
+    assert_eq!(replay_json["meta"]["replayed"], true);
+    assert_eq!(replay_json["data"], first_json["data"]);
+}
+
+#[test]
+fn log_json_returns_a_structured_command_conflict() {
+    let home = temp_home("json-log-conflict");
+    assert!(run(&home, &["init"]).status.success());
+    assert!(
+        run(
+            &home,
+            &[
+                "log",
+                "--json",
+                "--command-id",
+                "json-workout-conflict",
+                "Bench Press: 80x8@8",
+            ],
+        )
+        .status
+        .success()
+    );
+
+    let conflict = run(
+        &home,
+        &[
+            "log",
+            "--json",
+            "--command-id",
+            "json-workout-conflict",
+            "Bench Press: 85x8@8",
+        ],
+    );
+    assert!(!conflict.status.success());
+    let value: serde_json::Value = serde_json::from_str(&stdout(&conflict)).unwrap();
+    assert_eq!(value["ok"], false);
+    assert_eq!(value["error"]["code"], "COMMAND_CONFLICT");
+    assert_eq!(value["error"]["retryable"], false);
+}
+
+#[test]
+fn log_json_wraps_command_line_validation_errors() {
+    let home = temp_home("json-log-cli-error");
+    let invalid = run(&home, &["log", "--json", "--unknown-option", "Bench Press: 80x8"]);
+    assert!(!invalid.status.success());
+    let value: serde_json::Value = serde_json::from_str(&stdout(&invalid)).unwrap();
+    assert_eq!(value["ok"], false);
+    assert_eq!(value["error"]["code"], "INVALID_COMMAND");
+}
+
+#[test]
+fn reused_log_command_id_with_different_input_is_rejected() {
+    let home = temp_home("conflicting-log");
+    assert!(run(&home, &["init"]).status.success());
+    assert!(
+        run(
+            &home,
+            &[
+                "log",
+                "--command-id",
+                "workout-command-conflict",
+                "Bench Press: 80x8@8",
+            ],
+        )
+        .status
+        .success()
+    );
+
+    let conflict = run(
+        &home,
+        &[
+            "log",
+            "--command-id",
+            "workout-command-conflict",
+            "Bench Press: 85x8@8",
+        ],
+    );
+    assert!(!conflict.status.success());
+    assert!(stderr(&conflict).contains("already used with different input"));
+    let data = export_json(&home, "conflicting-log.json");
+    assert_eq!(data["set_logs"].as_array().unwrap().len(), 1);
+}
+
+#[test]
 fn config_is_included_in_context() {
     let home = temp_home("config");
     assert!(run(&home, &["init"]).status.success());
@@ -442,6 +606,18 @@ fn config_is_included_in_context() {
     let text = stdout(&context);
     assert!(text.contains("fat loss without losing muscle"));
     assert!(text.contains("avoid full-range knee flexion"));
+}
+
+#[test]
+fn unreadable_config_fails_instead_of_silently_dropping_constraints() {
+    let home = temp_home("unreadable-config");
+    assert!(run(&home, &["init"]).status.success());
+    fs::remove_file(home.join("config.json")).unwrap();
+    fs::create_dir(home.join("config.json")).unwrap();
+
+    let context = run(&home, &["context", "--last", "4weeks", "--format", "json"]);
+    assert!(!context.status.success());
+    assert!(stderr(&context).contains("config.json"));
 }
 
 #[test]
